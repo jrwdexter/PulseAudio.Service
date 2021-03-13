@@ -1,14 +1,12 @@
 using System;
-using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
-using System.Linq;
-using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
+using Serilog;
 
 namespace PulseAudio.ServiceWrapper
 {
@@ -26,8 +24,41 @@ namespace PulseAudio.ServiceWrapper
 
         protected override async Task ExecuteAsync(CancellationToken stoppingToken)
         {
-            while (!stoppingToken.IsCancellationRequested)
+            if (_processInfo == null)
             {
+                var servicePath = Path.GetFullPath(_serviceConfigInfo.Service);
+                var executableFile = new FileInfo(servicePath);
+
+                if (executableFile.Directory?.Parent == null)
+                    throw new FileNotFoundException("Could not find file to launch.");
+                Debug.Assert(executableFile.DirectoryName != null, "executableFile.DirectoryName != null");
+
+                var rootPath = executableFile.Directory.Parent.FullName;
+                _logger.LogInformation($"Starting application {servicePath}");
+                _logger.LogInformation($"Root path: {rootPath}");
+                var arguments = $"-p \"{rootPath}\\lib\\pulse-1.1\\modules\" -nF \"{rootPath}\\etc\\pulse\\default.pa\"";
+                _logger.LogInformation($"Launching pulse audio with args: {arguments}");
+
+                var startInfo = new ProcessStartInfo
+                {
+                    FileName = servicePath,
+                    Arguments = arguments,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    WorkingDirectory = executableFile.DirectoryName,
+                    CreateNoWindow = true,
+                    WindowStyle = ProcessWindowStyle.Hidden,
+                };
+                _processInfo = Process.Start(startInfo);
+                if (_processInfo == null)
+                    throw new ApplicationException("Could not start Pulse Audio");
+                _logger.LogInformation("Process started with ID: {Id}", _processInfo.Id);
+                Thread.Sleep(30000);
+            }
+            while (!stoppingToken.IsCancellationRequested && !_processInfo.HasExited)
+            {
+                if (!_processInfo.Responding)
+                    throw new ApplicationException(_processInfo.StandardError.ReadToEnd());
                 var stdLine = await _processInfo.StandardOutput.ReadLineAsync();
                 var errorLine = await _processInfo.StandardError.ReadLineAsync();
                 if (!string.IsNullOrEmpty(stdLine) || !string.IsNullOrEmpty(errorLine))
@@ -64,63 +95,23 @@ namespace PulseAudio.ServiceWrapper
             }
         }
 
-        public override Task StartAsync(CancellationToken cancellationToken)
-        {
-            var servicePath = Path.GetFullPath(_serviceConfigInfo.Service);
-            _logger.LogInformation($"Starting application {servicePath} .");
-
-            var startInfo = new ProcessStartInfo(servicePath)
-            {
-                RedirectStandardOutput = true,
-                RedirectStandardError = true,
-                CreateNoWindow = true,
-            };
-            _processInfo = Process.Start(startInfo);
-            return base.StartAsync(cancellationToken);
-        }
-
         public override Task StopAsync(CancellationToken cancellationToken)
         {
-            if (!_processInfo.HasExited)
-            {
-                _processInfo.Close();
-            }
+            TryCloseSubprocess();
             return base.StopAsync(cancellationToken);
         }
-    }
 
-    public class PulseOutputLogger : StreamWriter
-    {
-        public PulseOutputLogger(Stream stream) : base(stream)
+        public override void Dispose()
         {
+            TryCloseSubprocess();
+            Log.CloseAndFlush();
+            base.Dispose();
         }
 
-        public PulseOutputLogger(Stream stream, Encoding encoding) : base(stream, encoding)
+        private void TryCloseSubprocess()
         {
-        }
-
-        public PulseOutputLogger(Stream stream, Encoding encoding, int bufferSize) : base(stream, encoding, bufferSize)
-        {
-        }
-
-        public PulseOutputLogger(Stream stream, Encoding? encoding = null, int bufferSize = -1, bool leaveOpen = false) : base(stream, encoding, bufferSize, leaveOpen)
-        {
-        }
-
-        public PulseOutputLogger(string path) : base(path)
-        {
-        }
-
-        public PulseOutputLogger(string path, bool append) : base(path, append)
-        {
-        }
-
-        public PulseOutputLogger(string path, bool append, Encoding encoding) : base(path, append, encoding)
-        {
-        }
-
-        public PulseOutputLogger(string path, bool append, Encoding encoding, int bufferSize) : base(path, append, encoding, bufferSize)
-        {
+            if (_processInfo != null && !_processInfo.HasExited)
+                _processInfo.Close();
         }
     }
 }
